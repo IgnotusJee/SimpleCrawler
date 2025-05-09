@@ -63,7 +63,7 @@
 
 ```bash
 python3 craw.py run \
-  --pattern "https://spa1.scrape.center/api/movie/{cnt}/" \
+  --pattern "https://ssr1.scrape.center/detail/{cnt}/" \
   --var-rule cnt,type=number,start=1,end=10,step=1
 ```
 
