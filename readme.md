@@ -70,17 +70,30 @@ python scraper.py run \
 也可以将输入保存在 JSON 文件中，命令行传入文件位置
 
 ```json
-{
-  "url_template": "https://spa1.scrape.center/api/movie/{cnt}/",
-  "variables": {
-    "cnt": {
-      "type": "number",
-      "start": 1,
-      "end": 10,
-      "step": 1
+[
+  {
+    "url_template": "https://spa1.scrape.center/api/movie/{cnt}/",
+    "variables": {
+      "cnt": {
+        "type": "number",
+        "start": 1,
+        "end": 10,
+        "step": 1
+      }
+    }
+  },
+  {
+    "url_template": "https://www.biubiu001.com/sjzxd/{num}.html",
+    "variables": {
+      "num": {
+        "type": "number",
+        "start": 108450,
+        "end": 108486,
+        "step": 1
+      }
     }
   }
-}
+]
 ```
 
 ```bash
