@@ -1,0 +1,18 @@
+{
+    "concurrency": 5,
+    "retry_policy": {
+        "max_attempts": 3,
+        "backoff_base": 2
+    },
+    "storage": {
+        "base_dir": "./downloads",
+        "db_file": "scraped_data.db",
+        "max_file_size": 104857600
+    },
+    "logging": {
+        "log_filename": "scraper.log",
+        "backup_count": 5,
+        "max_bytes": 10485760
+    },
+    "user_agent": "Mozilla/5.0 (compatible; BatchScraper/1.0; +https://example.com/bot)"
+}
