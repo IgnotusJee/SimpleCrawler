@@ -62,7 +62,7 @@
 可以直接命令行输入
 
 ```bash
-python scraper.py run \
+python3 craw.py run \
   --pattern "https://spa1.scrape.center/api/movie/{cnt}/" \
   --var-rule cnt,type=number,start=1,end=10,step=1
 ```
