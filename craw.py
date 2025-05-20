@@ -19,6 +19,7 @@ from logging.handlers import RotatingFileHandler
 import argparse
 import json
 import magic
+from bs4 import BeautifulSoup
 
 # Configuration
 DEFAULT_CONFIG = {
@@ -35,8 +36,19 @@ DEFAULT_CONFIG = {
     'logging': {
         'log_filename': 'scraper.log',
         'backup_count': 5,
-        'max_bytes': 1024 * 5
+        'max_bytes': 1024 * 1024 * 10
     },
+    'file_types': {
+        'images': ['jpg', 'jpeg', 'png', 'gif', 'webp'],
+        'documents': ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'],
+        'archives': ['zip', 'rar', 'gz'],
+        'webviews': ['html', 'php', 'css'],
+        'texts': ['json', 'txt'],
+    },
+    'resource_patterns': [
+        r'.*\.(jpg|jpeg|png|gif|webp)(\?.*)?$',
+        r'.*\.(pdf|doc|docx|xls|xlsx)(\?.*)?$'
+    ],
     'user_agent': 'Mozilla/5.0 (compatible; BatchScraper/1.0; +https://example.com/bot)'
 }
 
@@ -45,9 +57,7 @@ class URLGenerator:
     """动态URL生成器"""
 
     def __init__(self, config: Dict[str, Any]):
-        """
-        :param config: 包含模板和生成规则的字典
-        """
+        """config: 包含模板和生成规则的字典"""
         self.template = config['url_template']
         self.rules = config['variables']
         self._validate_config()
@@ -129,24 +139,26 @@ class AsyncScraper:
         self.db_conn = sqlite3.connect(config['storage']['db_file'])
         self.timestamp = timestamp
         self.init_db()
+        self.queue = asyncio.Queue(maxsize=1000)
 
     def init_db(self):
         """初始化数据库"""
         with self.db_conn:
             self.db_conn.execute('''
-                CREATE TABLE IF NOT EXISTS pages (
-                    id INTEGER PRIMARY KEY,
-                    url TEXT,
-                    content_hash TEXT,
-                    file_path TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    status_code INTEGER,
-                    attempts INTEGER
-                )
-            ''')
+				CREATE TABLE IF NOT EXISTS pages (
+					id INTEGER PRIMARY KEY,
+					url TEXT,
+					content_hash TEXT,
+					file_path TEXT,
+					timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+					status_code INTEGER,
+					attempts INTEGER,
+					content_type TEXT
+				)
+			''')
             self.db_conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_url ON pages (url)
-            ''')
+				CREATE INDEX IF NOT EXISTS idx_content_type ON pages (content_type)
+			''')
 
     def setup_logger(self):
         """配置日志系统"""
@@ -168,21 +180,28 @@ class AsyncScraper:
         return logger
 
     async def fetch(self, url: str) -> Dict[str, Any]:
-        """执行单个请求"""
+        """执行单个请求（支持二进制内容）"""
         async with self.semaphore:
             for attempt in range(self.config['retry_policy']['max_attempts']):
                 try:
                     async with self.session.get(
                             url,
                             headers={'User-Agent': self.config['user_agent']},
-                            timeout=aiohttp.ClientTimeout(total=30)
+                            timeout=aiohttp.ClientTimeout(total=300)  # 延长超时时间
                     ) as response:
-                        content = await response.text()
-                        content_hash = hashlib.md5(content.encode()).hexdigest()
+                        # 根据内容类型决定读取方式
+                        content_type = response.headers.get('Content-Type', '').split(';')[0]
 
+                        if content_type.startswith('text/'):
+                            content = await response.text()
+                            content_hash = hashlib.md5(content.encode()).hexdigest()
+                        else:
+                            content = await response.read()
+                            content_hash = hashlib.md5(content).hexdigest()
                         return {
                             'url': url,
                             'content': content,
+                            'content_type': content_type,
                             'status': response.status,
                             'hash': content_hash,
                             'attempts': attempt + 1
@@ -191,6 +210,44 @@ class AsyncScraper:
                     self.logger.warning(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
                     await asyncio.sleep(self.config['retry_policy']['backoff_base'] ** attempt)
             return {'url': url, 'error': str(e), 'attempts': attempt + 1}
+
+    def extract_links(self, html: str, base_url: str) -> set:
+        """从HTML内容中提取资源链接"""
+        soup = BeautifulSoup(html, 'html.parser')
+        links = set()
+
+        # 提取图片链接
+        for img in soup.find_all('img'):
+            src = img.get('src')
+            if src:
+                links.add(self.normalize_url(base_url, src))
+
+        # 提取文件链接
+        for a in soup.find_all('a'):
+            href = a.get('href')
+            if href and self.is_resource_link(href):
+                links.add(self.normalize_url(base_url, href))
+
+        return links
+
+    def normalize_url(self, base_url: str, path: str) -> str:
+        """规范化相对路径为绝对URL"""
+        parsed_base = urlparse(base_url)
+        if path.startswith('//'):
+            return f"{parsed_base.scheme}:{path}"
+        elif path.startswith('/'):
+            return f"{parsed_base.scheme}://{parsed_base.netloc}{path}"
+        elif path.startswith(('http://', 'https://')):
+            return path
+        else:
+            return f"{parsed_base.scheme}://{parsed_base.netloc}/{path}"
+
+    def is_resource_link(self, url: str) -> bool:
+        """判断是否是资源链接"""
+        for pattern in self.config['resource_patterns']:
+            if re.match(pattern, url, re.IGNORECASE):
+                return True
+        return False
 
     async def worker(self, queue: asyncio.Queue):
         """工作协程"""
@@ -207,7 +264,6 @@ class AsyncScraper:
         if 'error' in result:
             self.logger.error(f"Failed to fetch {result['url']}: {result['error']}")
             return
-
         # 内容去重检查
         cur = self.db_conn.execute(
             'SELECT url FROM pages WHERE content_hash = ?',
@@ -216,59 +272,115 @@ class AsyncScraper:
         if cur.fetchone():
             self.logger.info(f"Skipping duplicate content: {result['url']}")
             return
-
-        # 存储到文件系统
-        file_path = self.save_to_file(result['url'], str(result['content']))
-
+        # 保存文件
+        try:
+            file_path = self.save_to_file(
+                result['url'],
+                result['content'],
+                result.get('content_type', 'text/html')
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to save {result['url']}: {str(e)}")
+            return
         # 存储到数据库
         self.db_conn.execute('''
-            INSERT INTO pages (url, content_hash, file_path, status_code, attempts)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (
+			INSERT INTO pages (url, content_hash, file_path, status_code, attempts, content_type)
+			VALUES (?, ?, ?, ?, ?, ?)
+		''', (
             result['url'],
             result['hash'],
             file_path,
             result['status'],
-            result['attempts']
+            result['attempts'],
+            result.get('content_type', '')
         ))
         self.db_conn.commit()
+        # 如果是HTML内容，提取资源链接
+        if result.get('content_type', '').startswith('text/html'):
+            try:
+                html_content = result['content'].decode('utf-8') if isinstance(result['content'], bytes) else result[
+                    'content']
+                resource_links = self.extract_links(html_content, result['url'])
+                await self.enqueue_resources(resource_links)
+            except Exception as e:
+                self.logger.error(f"Failed to extract links from {result['url']}: {str(e)}")
 
-    def save_to_file(self, url: str, content: str) -> str:
-        """保存到文件系统"""
+    async def enqueue_resources(self, links: set):
+        """将资源链接加入队列"""
+        for link in links:
+            if not self.is_duplicate_url(link):
+                await self.queue.put(link)
+
+    def is_duplicate_url(self, url: str) -> bool:
+        """检查URL是否已经处理过"""
+        cur = self.db_conn.execute(
+            'SELECT url FROM pages WHERE url = ?',
+            (url,)
+        )
+        return cur.fetchone() is not None
+
+    def save_to_file(self, url: str, content: Any, content_type: str) -> str:
+        """保存到文件系统（支持二进制）"""
         parsed_url = urlparse(url)
         path = parsed_url.path.strip('/') or 'index'
-        safe_filename = re.sub(r'[^\w\-_.]', '_', path)
 
-        filetype = magic.from_buffer(content, mime=True).split('/')[-1]
-        if not safe_filename.endswith(f'.{filetype}'):
-            safe_filename += f'.{filetype}'
+        # 生成安全文件名
+        safe_filename = re.sub(r'[^\w\-_.]', '_', path.split('/')[-1][:128])
+        file_extend = os.path.splitext(safe_filename)[-1]
+
+        if content_type.startswith('image/'):
+            # 根据内容类型确定扩展名
+            file_ext = content_type.split('/')[-1]
+        else:
+            # 使用magic库检测实际文件类型
+            mime = magic.from_buffer(content, mime=True)
+            file_ext = mime.split('/')[-1] if '/' in mime else 'bin'
+
+        if file_extend == '':
+            safe_filename += f'.{file_ext}'
+
+        # 构建存储路径
+        category = self.get_file_category(file_ext)
         full_path = os.path.join(
             self.config['storage']['base_dir'],
             self.timestamp,
+            category,
             parsed_url.netloc,
             safe_filename
         )
-
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        with open(full_path, 'w', encoding='utf-8') as f:
+
+        # 写入文件
+        mode = 'wb' if isinstance(content, bytes) else 'w'
+        encoding = None if isinstance(content, bytes) else 'utf-8'
+
+        with open(full_path, mode, encoding=encoding) as f:
             f.write(content)
+
         return full_path
+
+    def get_file_category(self, ext: str) -> str:
+        """获取文件分类目录"""
+        ext = ext.lower()
+        for category, exts in self.config['file_types'].items():
+            if ext in exts:
+                return category
+        return 'others'
 
     async def run(self, urls: URLGenerator):
         """运行抓取任务"""
-        queue = asyncio.Queue(maxsize=1000)
 
         # 创建worker任务
         workers = [
-            asyncio.create_task(self.worker(queue))
+            asyncio.create_task(self.worker(self.queue))
             for _ in range(self.config['concurrency'])
         ]
 
         # 填充任务队列
         async def populate_queue():
             for url in urls:
-                await queue.put(url)
-            await queue.join()
+                await self.queue.put(url)
+            await self.queue.join()
 
         async with aiohttp.ClientSession() as self.session:
             await populate_queue()
@@ -420,22 +532,22 @@ def main():
     clean_parser = subparsers.add_parser('clean', description='Clean generated and downloaded files')
     clean_group = clean_parser.add_mutually_exclusive_group(required=True)
     clean_group.add_argument('-a', '--all',
-                              action='store_true',
-                              help='Clean all log, downloaded and db file')
+                             action='store_true',
+                             help='Clean all log, downloaded and db file')
     clean_group.add_argument('-o', '--log',
                              action='store_true',
-                              help='Clean log files')
+                             help='Clean log files')
     clean_group.add_argument('-d', '--download',
                              action='store_true',
-                              help='Clean download folder')
+                             help='Clean download folder')
     clean_group.add_argument('-D', '--database',
                              action='store_true',
-                              help='Clean database file')
+                             help='Clean database file')
 
     args = parser.parse_args()
 
     # 初始化配置
-    if(args.config and os.path.exists(args.config)):
+    if (args.config and os.path.exists(args.config)):
         with open(args.config, 'r', encoding='utf-8') as f:
             try:
                 config = json.load(f)
@@ -479,4 +591,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
