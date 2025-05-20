@@ -1,6 +1,6 @@
 [
   {
-    "url_template": "https://spa1.scrape.center/api/movie/{cnt}/",
+    "url_template": "https://spa1.scrape.center/detail/{cnt}",
     "variables": {
       "cnt": {
         "type": "number",
@@ -8,7 +8,8 @@
         "end": 10,
         "step": 1
       }
-    }
+    },
+    "force_render": true
   },
   {
     "url_template": "https://www.biubiu001.com/sjzxd/{num}.html",

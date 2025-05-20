@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Batch Web Scraper with Auto-Retry and Smart Storage
+Enhanced Batch Web Scraper with Anti-Anti-Scraping Features
 """
-
 import os
 import re
 import sys
@@ -10,18 +9,19 @@ import aiohttp
 import asyncio
 import hashlib
 import sqlite3
+import random
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
-from typing import Iterator, Dict, Any
+from typing import Iterator, Dict, Any, Optional
 from itertools import product
 import logging
 from logging.handlers import RotatingFileHandler
 import argparse
 import json
-import magic
 from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+from playwright.async_api import async_playwright
 
-# Configuration
 DEFAULT_CONFIG = {
     'concurrency': 5,
     'retry_policy': {
@@ -31,7 +31,7 @@ DEFAULT_CONFIG = {
     'storage': {
         'base_dir': './downloads',
         'db_file': 'scraped_data.db',
-        'max_file_size': 1024 * 1024 * 100  # 100MB
+        'max_file_size': 1024 * 1024 * 100
     },
     'logging': {
         'log_filename': 'scraper.log',
@@ -49,7 +49,20 @@ DEFAULT_CONFIG = {
         r'.*\.(jpg|jpeg|png|gif|webp)(\?.*)?$',
         r'.*\.(pdf|doc|docx|xls|xlsx)(\?.*)?$'
     ],
-    'user_agent': 'Mozilla/5.0 (compatible; BatchScraper/1.0; +https://example.com/bot)'
+    'browser': {
+        'timeout': 30000,  # 30秒超时
+        'max_pages': 3  # 最大并发页面数
+    },
+    'request_delay': [0.5, 3.0],  # 随机延迟范围
+    'proxies': [],  # 代理服务器列表
+    'headers': {  # 基础请求头
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': 'https://www.google.com/',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+    }
 }
 
 
@@ -60,12 +73,17 @@ class URLGenerator:
         """config: 包含模板和生成规则的字典"""
         self.template = config['url_template']
         self.rules = config['variables']
+        self.fixed = False
         self._validate_config()
 
     def _validate_config(self):
         """验证配置完整性"""
         # 提取模板变量
         variables = set(re.findall(r'\{(.*?)}', self.template))
+
+        if len(variables) == 0:
+            self.fixed = True
+            return
 
         # 验证规则匹配
         missing = variables - set(self.rules.keys())
@@ -116,6 +134,10 @@ class URLGenerator:
 
     def __iter__(self) -> Iterator[str]:
         """生成完整的URL序列"""
+        if self.fixed:
+            yield self.template
+            return
+
         values = self._generate_values()
 
         # 生成笛卡尔积
@@ -129,17 +151,29 @@ class URLGenerator:
 
 
 class AsyncScraper:
-    """异步抓取引擎"""
+    """异步抓取引擎（增强反爬能力版）"""
 
-    def __init__(self, config: Dict[str, Any], timestamp):
+    def __init__(self, config: Dict[str, Any], timestamp, force_render):
+        self.playwright = None
         self.config = config
+        self.timestamp = timestamp
+        # 是否强制网页渲染
+        self.force_render = force_render
+
+        # 初始化浏览器指纹
+        self.ua = UserAgent()
+        self.browser = None
+        self.browser_sem = None
+
+        # 初始化异步组件
         self.session = None
         self.semaphore = asyncio.Semaphore(config['concurrency'])
         self.logger = self.setup_logger()
         self.db_conn = sqlite3.connect(config['storage']['db_file'])
-        self.timestamp = timestamp
         self.init_db()
         self.queue = asyncio.Queue(maxsize=1000)
+        # 用户代理轮换缓存
+        self._current_headers = None
 
     def init_db(self):
         """初始化数据库"""
@@ -179,37 +213,184 @@ class AsyncScraper:
         logger.addHandler(file_handler)
         return logger
 
-    async def fetch(self, url: str) -> Dict[str, Any]:
-        """执行单个请求（支持二进制内容）"""
+    async def __aenter__(self):
+        """异步上下文管理"""
+        await self.init_browser()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        """清理资源"""
+        await self.close()
+
+    async def init_browser(self):
+        """初始化无头浏览器"""
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(
+            headless=True,
+            proxy={
+                'server': self._random_proxy()
+            } if self.config['proxies'] else None
+        )
+        self.browser_sem = asyncio.Semaphore(
+            self.config['browser']['max_pages']
+        )
+
+    async def close(self):
+        """关闭所有资源"""
+        if self.session:
+            await self.session.close()
+        if self.browser:
+            await self.browser.close()
+        if hasattr(self, 'playwright'):
+            await self.playwright.stop()
+        self.db_conn.close()
+
+    def _random_proxy(self) -> Optional[str]:
+        """随机获取代理服务器"""
+        return random.choice(self.config['proxies']) if self.config['proxies'] else None
+
+    def _gen_headers(self) -> Dict[str, str]:
+        """生成动态请求头"""
+        base = {
+            'User-Agent': self.ua.random,
+            **self.config['headers']
+        }
+        # 自动添加Referer链
+        if self._current_headers and 'Referer' in self._current_headers:
+            base['Referer'] = self._current_headers['Referer']
+        return base
+
+    async def fetch(self, url: str, is_resource: bool) -> Dict[str, Any]:
+        """智能请求方法"""
+        # 随机延迟
+        delay = random.uniform(*self.config['request_delay'])
+        await asyncio.sleep(delay)
+
+        if not is_resource and self.force_render:
+            result = await self._browser_fetch(url)
+        else:
+            # 优先尝试API请求
+            result = await self._http_fetch(url)
+            # 需要浏览器渲染的情况
+            if not is_resource and self._needs_browser_rendering(result):
+                result = await self._browser_fetch(url)
+
+        return result
+
+    async def _http_fetch(self, url: str) -> Dict[str, Any]:
+        """使用aiohttp进行请求"""
+        headers = self._gen_headers()
+        self._current_headers = headers  # 保存当前headers
         async with self.semaphore:
             for attempt in range(self.config['retry_policy']['max_attempts']):
                 try:
                     async with self.session.get(
                             url,
-                            headers={'User-Agent': self.config['user_agent']},
-                            timeout=aiohttp.ClientTimeout(total=300)  # 延长超时时间
+                            headers=headers,
+                            proxy=self._random_proxy(),
+                            timeout=aiohttp.ClientTimeout(total=30),
+                            ssl=False
                     ) as response:
-                        # 根据内容类型决定读取方式
-                        content_type = response.headers.get('Content-Type', '').split(';')[0]
+                        content = await self._process_response(response)
+                        return self._success_result(url, content, response)
 
-                        if content_type.startswith('text/'):
-                            content = await response.text()
-                            content_hash = hashlib.md5(content.encode()).hexdigest()
-                        else:
-                            content = await response.read()
-                            content_hash = hashlib.md5(content).hexdigest()
-                        return {
-                            'url': url,
-                            'content': content,
-                            'content_type': content_type,
-                            'status': response.status,
-                            'hash': content_hash,
-                            'attempts': attempt + 1
-                        }
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    self.logger.warning(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
-                    await asyncio.sleep(self.config['retry_policy']['backoff_base'] ** attempt)
-            return {'url': url, 'error': str(e), 'attempts': attempt + 1}
+                except Exception as e:
+                    await self._handle_error(url, e, attempt)
+            return self._failure_result(url)
+
+    async def _browser_fetch(self, url: str) -> Dict[str, Any]:
+        """使用无头浏览器获取页面"""
+        async with self.browser_sem:
+            page = None
+            try:
+                context = await self.browser.new_context(
+                    user_agent=self.ua.random,
+                    locale='en-US',
+                    timezone_id='America/New_York',
+                )
+                page = await context.new_page()
+
+                # 设置浏览器指纹
+                await self._set_browser_fingerprint(page)
+                await page.goto(url, timeout=self.config['browser']['timeout'])
+
+                # 等待页面加载完成
+                await page.wait_for_load_state('networkidle')
+
+                # 获取最终内容
+                content = await page.content()
+                return self._success_result(url, content)
+
+            except Exception as e:
+                self.logger.error(f"Browser fetch failed: {str(e)}")
+                return self._failure_result(url)
+            finally:
+                if page:
+                    await page.close()
+                if context:
+                    await context.close()
+
+    async def _set_browser_fingerprint(self, page):
+        """设置浏览器指纹"""
+        # 覆盖webdriver属性
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            })
+        """)
+        # 设置屏幕分辨率
+        await page.set_viewport_size({"width": 1920, "height": 1080})
+
+    async def _process_response(self, response) -> Any:
+        """处理响应内容"""
+        content_type = response.headers.get('Content-Type', '').split(';')[0]
+        if 'text' in content_type:
+            return await response.text()
+        return await response.read()
+
+    def _needs_browser_rendering(self, result: Dict) -> bool:
+        """判断是否需要浏览器渲染"""
+        if result.get('status') != 200 or result.get('content_type', '') != 'text/html':
+            return False
+        # 检测JS重定向
+        if '<meta http-equiv="refresh"' in result.get('content', ''):
+            return True
+        # 检测常见反爬技术
+        anti_selectors = [
+            '#challenge-form',  # Cloudflare
+            '.geetest_captcha',  # Geetest
+            '#px-captcha'  # PerimeterX
+        ]
+        soup = BeautifulSoup(result.get('content', ''), 'html.parser')
+        return any(soup.select(selector) for selector in anti_selectors)
+
+    def _success_result(self, url: str, content: Any, response=None) -> Dict:
+        """构造成功响应"""
+        is_text = isinstance(content, str)
+        hash_str = hashlib.md5(content.encode() if is_text else content).hexdigest()
+
+        return {
+            'url': url,
+            'content': content,
+            'content_type': response.headers.get('Content-Type', '') if response else 'text/html',
+            'status': response.status if response else 200,
+            'hash': hash_str,
+            'attempts': 1
+        }
+
+    async def _handle_error(self, url: str, error: Exception, attempt: int):
+        """统一错误处理"""
+        self.logger.warning(f"Attempt {attempt + 1} failed for {url}: {str(error)}")
+        backoff = self.config['retry_policy']['backoff_base'] ** attempt
+        await asyncio.sleep(backoff + random.uniform(0, 1))
+
+    def _failure_result(self, url: str) -> Dict:
+        """构造失败响应"""
+        return {
+            'url': url,
+            'error': 'Max retries exceeded',
+            'attempts': self.config['retry_policy']['max_attempts']
+        }
 
     def extract_links(self, html: str, base_url: str) -> set:
         """从HTML内容中提取资源链接"""
@@ -249,16 +430,6 @@ class AsyncScraper:
                 return True
         return False
 
-    async def worker(self, queue: asyncio.Queue):
-        """工作协程"""
-        while True:
-            url = await queue.get()
-            try:
-                result = await self.fetch(url)
-                await self.process_result(result)
-            finally:
-                queue.task_done()
-
     async def process_result(self, result: Dict[str, Any]):
         """处理抓取结果"""
         if 'error' in result:
@@ -296,7 +467,7 @@ class AsyncScraper:
         ))
         self.db_conn.commit()
         # 如果是HTML内容，提取资源链接
-        if result.get('content_type', '').startswith('text/html'):
+        if file_path.endswith('html'):
             try:
                 html_content = result['content'].decode('utf-8') if isinstance(result['content'], bytes) else result[
                     'content']
@@ -309,7 +480,7 @@ class AsyncScraper:
         """将资源链接加入队列"""
         for link in links:
             if not self.is_duplicate_url(link):
-                await self.queue.put(link)
+                await self.queue.put((link, True))
 
     def is_duplicate_url(self, url: str) -> bool:
         """检查URL是否已经处理过"""
@@ -326,18 +497,11 @@ class AsyncScraper:
 
         # 生成安全文件名
         safe_filename = re.sub(r'[^\w\-_.]', '_', path.split('/')[-1][:128])
-        file_extend = os.path.splitext(safe_filename)[-1]
+        safe_filename = os.path.splitext(safe_filename)[0]
 
-        if content_type.startswith('image/'):
-            # 根据内容类型确定扩展名
-            file_ext = content_type.split('/')[-1]
-        else:
-            # 使用magic库检测实际文件类型
-            mime = magic.from_buffer(content, mime=True)
-            file_ext = mime.split('/')[-1] if '/' in mime else 'bin'
+        file_ext = content_type.split('/')[-1].split(';')[0].split('+')[0]
 
-        if file_extend == '':
-            safe_filename += f'.{file_ext}'
+        safe_filename += f'.{file_ext}'
 
         # 构建存储路径
         category = self.get_file_category(file_ext)
@@ -368,27 +532,36 @@ class AsyncScraper:
         return 'others'
 
     async def run(self, urls: URLGenerator):
-        """运行抓取任务"""
-
-        # 创建worker任务
-        workers = [
-            asyncio.create_task(self.worker(self.queue))
-            for _ in range(self.config['concurrency'])
-        ]
-
-        # 填充任务队列
-        async def populate_queue():
-            for url in urls:
-                await self.queue.put(url)
-            await self.queue.join()
-
+        """运行增强版抓取任务"""
         async with aiohttp.ClientSession() as self.session:
+            # 创建混合worker
+            workers = [
+                asyncio.create_task(self._mixed_worker())
+                for _ in range(self.config['concurrency'] * 2)
+            ]
+
+            # 填充队列
+            async def populate_queue():
+                for url in urls:
+                    await self.queue.put((url, False))
+                await self.queue.join()
+
             await populate_queue()
 
-        # 清理worker
-        for worker in workers:
-            worker.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+            # 清理worker
+            for w in workers:
+                w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _mixed_worker(self):
+        """混合模式worker"""
+        while True:
+            url, isr = await self.queue.get()
+            try:
+                result = await self.fetch(url, isr)
+                await self.process_result(result)
+            finally:
+                self.queue.task_done()
 
 
 def cleanup_resources(args, config):
@@ -429,9 +602,12 @@ def cleanup_resources(args, config):
             print(f"ℹ️ 下载目录不存在: {download_dir}")
 
 
-def run_crawler(config, url_input, time):
+async def run_crawler(config, url_input, time, force_render=False):
     """爬取主程序"""
     os.makedirs(config['storage']['base_dir'], exist_ok=True)
+
+    if url_input.get('force_render'):
+        force_render = True
 
     # 生成URL列表
     try:
@@ -441,16 +617,8 @@ def run_crawler(config, url_input, time):
         sys.exit(1)
 
     # 运行抓取任务
-    scraper = AsyncScraper(config, time)
-
-    # 创建新事件循环（显式指定）
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)  # 绑定到当前上下文
-
-    try:
-        loop.run_until_complete(scraper.run(urls))
-    finally:
-        loop.close()  # 明确清理资源
+    async with AsyncScraper(config, time, force_render) as scraper:
+        await scraper.run(urls)
 
 
 class VarAction(argparse.Action):
@@ -528,6 +696,8 @@ def main():
     run_parser.add_argument('-p', '--pattern', help='URL pattern with placeholders {var}')
     run_parser.add_argument('-a', '--var-rule', action=VarAction, metavar="VAR_RULE",
                             help='Var rule, e.g. date,type=date,start=20240101,end=20240105,step=1,format=%%Y-%%m-%%d')
+    run_parser.add_argument('-f', '--force-render', action='store_true', default=False,
+                            help='Enable forced using browser render engine')
 
     clean_parser = subparsers.add_parser('clean', description='Clean generated and downloaded files')
     clean_group = clean_parser.add_mutually_exclusive_group(required=True)
@@ -547,7 +717,7 @@ def main():
     args = parser.parse_args()
 
     # 初始化配置
-    if (args.config and os.path.exists(args.config)):
+    if args.config and os.path.exists(args.config):
         with open(args.config, 'r', encoding='utf-8') as f:
             try:
                 config = json.load(f)
@@ -571,21 +741,28 @@ def main():
 
         nowtime = datetime.now().strftime("%Y%m%d%H%M%S")
         print("Start doing crawling job...")
-        if args.pattern:
-            input = {
-                "url_template": args.pattern,
-                "variables": args.var_rules
-            }
-            run_crawler(config, input, nowtime)
-        else:
-            with open(args.input, 'r', encoding='utf-8') as f:
-                inputs = json.load(f)
-            for input in inputs:
-                if 'url_template' not in input or 'variables' not in input:
-                    print("Invalid input file format")
-                    return
-                run_crawler(config, input, nowtime)
-                print(f"Done crawling job for {input['url_template']}")
+        # 创建新事件循环（显式指定）
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)  # 绑定到当前上下文
+
+        try:
+            if args.pattern:
+                _input = {
+                    "url_template": args.pattern,
+                    "variables": args.var_rules if hasattr(args, 'var_rules') else None
+                }
+                loop.run_until_complete(run_crawler(config, _input, nowtime, args.force_render))
+            else:
+                with open(args.input, 'r', encoding='utf-8') as f:
+                    inputs = json.load(f)
+                for _input in inputs:
+                    if 'url_template' not in _input or 'variables' not in _input:
+                        print("Invalid input file format")
+                        return
+                    loop.run_until_complete(run_crawler(config, _input, nowtime))
+                    print(f"Done crawling job for {_input['url_template']}")
+        finally:
+            loop.close()  # 明确清理资源
         print("Done crawling job")
 
 

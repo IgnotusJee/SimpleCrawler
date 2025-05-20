@@ -28,7 +28,7 @@
 
 ## 配置与使用指南
 
-项目使用 ubuntu 24.04, python 3.12.3 环境，可以通过`pip install -r requirements.txt`配置依赖。
+项目使用 windows 11 / ubuntu 24.04, python 3.12.10 环境，可以通过`pip install -r requirements.txt`配置依赖。
 
 ### 配置方式
 
@@ -38,7 +38,7 @@
 
 ```json
 {
-    "concurrency": 5,
+    "oncurrency": 5,
     "retry_policy": {
         "max_attempts": 3,
         "backoff_base": 2
@@ -53,13 +53,37 @@
         "backup_count": 5,
         "max_bytes": 10485760
     },
-    "user_agent": "Mozilla/5.0 (compatible; BatchScraper/1.0; +https://example.com/bot)"
+    "file_types": {
+        "images": ["jpg", "jpeg", "png", "gif", "webp"],
+        "documents": ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx"],
+        "archives": ["zip", "rar", "gz"],
+        "webviews": ["html", "php", "css"],
+        "texts": ["json", "txt"]
+    },
+    "resource_patterns": [
+        ".*\\.(jpg|jpeg|png|gif|webp)(\\?.*)?$",
+        ".*\\.(pdf|doc|docx|xls|xlsx)(\\?.*)?$"
+    ],
+    "browser": {
+        "timeout": 30000,
+        "max_pages": 3
+    },
+    "request_delay": [0.5, 3.0],
+    "proxies": [],
+    "headers": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://www.google.com/",
+        "DNT": "1",
+        "Connection": "keep-alive"
+    }
 }
 ```
 
 **2. 输入方式**
 
-可以直接命令行输入
+可以直接命令行输入，可以爬取单种网页
 
 ```bash
 python3 craw.py run \
@@ -67,12 +91,12 @@ python3 craw.py run \
   --var-rule cnt,type=number,start=1,end=10,step=1
 ```
 
-也可以将输入保存在 JSON 文件中，命令行传入文件位置
+也可以将输入保存在 JSON 文件中，命令行传入文件位置，可以一次爬多个网页
 
 ```json
 [
   {
-    "url_template": "https://spa1.scrape.center/api/movie/{cnt}/",
+    "url_template": "https://spa1.scrape.center/detail/{cnt}",
     "variables": {
       "cnt": {
         "type": "number",
@@ -80,7 +104,8 @@ python3 craw.py run \
         "end": 10,
         "step": 1
       }
-    }
+    },
+    "force_render": true
   },
   {
     "url_template": "https://www.biubiu001.com/sjzxd/{num}.html",
@@ -102,16 +127,16 @@ python3 craw.py run -i target.json
 
 ### 运行参数说明
 
-| 参数组   | 参数          | 说明                                                         |
-| -------- | ------------- | ------------------------------------------------------------ |
-| 核心参数 | -c/--config   | 指定配置文件路径（默认使用内置配置）                         |
-|          | -i/--input    | JSON格式的爬取目标配置文件                                   |
-|          | -p/--pattern  | 直接指定URL模板                                              |
+| 参数组  | 参数            | 说明                                                         |
+|------|---------------|------------------------------------------------------------|
+| 核心参数 | -c/--config   | 指定配置文件路径（默认使用内置配置）                                         |
+|      | -i/--input    | JSON格式的爬取目标配置文件                                            |
+|      | -p/--pattern  | 直接指定URL模板                                                  |
 | 变量规则 | -a/--var-rule | 变量定义语法：`变量名,type=类型,start=起始值,end=结束值,step=步长[,format=格式]` |
-| 清理参数 | -a/--all      | 清理所有持久化数据                                           |
-|          | -o/--log      | 仅清理日志文件                                               |
-|          | -d/--download | 仅清理下载目录                                               |
-|          | -D/--database | 仅清理数据库                                                 |
+| 清理参数 | -a/--all      | 清理所有持久化数据                                                  |
+|      | -o/--log      | 仅清理日志文件                                                    |
+|      | -d/--download | 仅清理下载目录                                                    |
+|      | -D/--database | 仅清理数据库                                                     |
 
 ### 典型工作流程
 

@@ -1,5 +1,5 @@
 {
-    "concurrency": 5,
+    "oncurrency": 5,
     "retry_policy": {
         "max_attempts": 3,
         "backoff_base": 2
@@ -14,5 +14,29 @@
         "backup_count": 5,
         "max_bytes": 10485760
     },
-    "user_agent": "Mozilla/5.0 (compatible; BatchScraper/1.0; +https://example.com/bot)"
+    "file_types": {
+        "images": ["jpg", "jpeg", "png", "gif", "webp"],
+        "documents": ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx"],
+        "archives": ["zip", "rar", "gz"],
+        "webviews": ["html", "php", "css"],
+        "texts": ["json", "txt"]
+    },
+    "resource_patterns": [
+        ".*\\.(jpg|jpeg|png|gif|webp)(\\?.*)?$",
+        ".*\\.(pdf|doc|docx|xls|xlsx)(\\?.*)?$"
+    ],
+    "browser": {
+        "timeout": 30000,
+        "max_pages": 3
+    },
+    "request_delay": [0.5, 3.0],
+    "proxies": [],
+    "headers": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://www.google.com/",
+        "DNT": "1",
+        "Connection": "keep-alive"
+    }
 }
